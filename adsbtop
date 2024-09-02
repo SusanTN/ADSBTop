@@ -1,0 +1,750 @@
+#!/usr/bin/python3
+
+import sys
+import json
+import time
+import os
+import re
+import tabulate
+import watchdog
+import textwrap
+import threading
+import datetime
+import shutil
+
+from datetime import datetime
+from tabulate import tabulate
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+from itertools import zip_longest
+
+
+lock = threading.Lock()
+script_start_time = time.time()
+
+# Config file path
+config_file_path = "/etc/adsbtop.json"
+backup_file_path = "/etc/adsbtop_backup.json"  # Backup file path
+
+default_config = {
+    "json_files": [
+        "/var/run/readsb/aircraft.json",
+        "/var/run/readsb/receiver.json",
+        "/var/run/readsb/stats.json",
+        "/var/run/readsb/status.json"
+    ],
+    "monitor_path": "/var/run/readsb/",
+    "log_file": "adsb_stats.log",
+    "box_width": 65,
+    "expire_time": 3600,
+    "adsbtop_version": "1.1",
+    "record_max_range": 0,
+    "record_max_range_timestamp": 0,
+    "record_min_range": float('inf'),
+    "record_min_range_timestamp": 0,
+    "record_max_aircraft": 0,
+    "record_max_aircraft_timestamp": 0,
+    "record_min_aircraft": float('inf'),
+    "record_min_aircraft_timestamp": 0,
+    "record_max_uptime": 0,
+    "record_max_uptime_timestamp": 0,
+    "record_max_messages": 0,
+    "record_max_messages_timestamp": 0,
+    "record_max_messages_per_sec": 0,
+    "record_max_messages_per_sec_timestamp": 0,
+    "record_max_positions": 0,
+    "record_max_positions_timestamp": 0
+}
+
+# Load config from file or create with default values
+def load_config():
+    if os.path.exists(config_file_path):
+        with open(config_file_path, "r") as config_file:
+            return json.load(config_file)
+    else:
+        return default_config
+
+config = load_config()
+
+# Backup the current config file
+def backup_config():
+    if os.path.exists(config_file_path):
+        shutil.copyfile(config_file_path, backup_file_path)
+
+# Restore the backup config file
+def restore_backup():
+    if os.path.exists(backup_file_path):
+        shutil.copyfile(backup_file_path, config_file_path)
+        return True
+    return False
+
+# Create a backup before any updates
+backup_config()
+
+# Additional logic to handle configuration errors and restore backup
+def check_and_restore_config():
+    try:
+        with open(config_file_path, "r") as config_file:
+            json.load(config_file)
+    except json.JSONDecodeError:
+        restore_backup()
+
+check_and_restore_config()
+
+json_files = config["json_files"]
+monitor_path = config["monitor_path"]
+log_file = config["log_file"]
+box_width = config["box_width"]
+expire_time = config["expire_time"]
+adsbtop_version = config["adsbtop_version"]
+
+# Load record variables from the configuration file
+record_max_range = config.get("record_max_range", 0)
+record_min_range = config.get("record_min_range", float('inf'))
+record_max_aircraft = config.get("record_max_aircraft", 0)
+record_min_aircraft = config.get("record_min_aircraft", float('inf'))
+record_max_range_timestamp = config.get("record_max_range_timestamp", 0)
+record_min_range_timestamp = config.get("record_min_range_timestamp", 0)
+record_max_aircraft_timestamp = config.get("record_max_aircraft_timestamp", 0)
+record_min_aircraft_timestamp = config.get("record_min_aircraft_timestamp", 0)
+record_max_uptime = config.get("record_max_uptime", 0)
+record_max_uptime_timestamp = config.get("record_max_uptime_timestamp", 0)
+record_max_messages = config.get("record_max_messages", 0)
+record_max_messages_timestamp = config.get("record_max_messages_timestamp", 0)
+record_max_messages_per_sec = config.get("record_max_messages_per_sec", 0)
+record_max_messages_per_sec_timestamp = config.get("record_max_messages_per_sec_timestamp", 0)
+record_max_positions = config.get("record_max_positions", 0)
+record_max_positions_timestamp = config.get("record_max_positions_timestamp", 0)
+
+# Initialize cumulative variables
+cumulative_unique_aircraft_with_pos = {}
+cumulative_unique_total_aircraft = {}
+cumulative_unique_aircraft_without_pos = set()
+cumulative_max_range = 0
+cumulative_min_range = float('inf')
+cumulative_avg_range = 0
+cumulative_max_signal = float('-inf')
+cumulative_avg_signal = 0
+cumulative_min_signal = float('inf')
+cumulative_strong_signals = 0
+previous_strong_signals = 0
+cumulative_messages = 0
+cumulative_max_aircraft = 0  # Initialize with 0
+cumulative_max_aircraft_timestamp = 0
+cumulative_min_aircraft = float('inf')  # Initialize with float('inf')
+cumulative_min_aircraft_timestamp = 0
+cumulative_most_messages = 0
+cumulative_most_messages_timestamp = 0
+cumulative_most_messages_persec = 0
+cumulative_most_messages_persec_timestamp = 0
+cumulative_most_positions = 0
+cumulative_most_positions_timestamp = 0
+cumulative_most_positions_persec = 0
+cumulative_most_positions_persec_timestamp = 0
+
+def hide_cursor():
+    sys.stdout.write("\033[?25l")
+    sys.stdout.flush()
+
+# Function to show the cursor
+def show_cursor():
+    sys.stdout.write("\033[?25h")
+    sys.stdout.flush()
+
+def load_json_file(filepath):
+    """Load JSON data from a file."""
+    with open(filepath) as f:
+        return json.load(f)
+
+def calculate_uptime(seconds):
+    """Convert uptime in seconds to a formatted string."""
+    seconds = int(seconds)  # Convert to integer
+    days = seconds // 86400
+    hours = (seconds % 86400) // 3600
+    minutes = (seconds % 3600) // 60
+    seconds = seconds % 60
+    return f"{days} days, {hours:02d}:{minutes:02d}:{seconds:02d}"
+
+def extract_statistics():
+    """Extract statistics from JSON files."""
+    try:
+        stats_data = load_json_file('/var/run/readsb/stats.json')
+        status_data = load_json_file('/var/run/readsb/status.json')
+        aircraft_data = load_json_file('/var/run/readsb/aircraft.json')
+        receiver_data = load_json_file('/var/run/readsb/receiver.json')
+    except FileNotFoundError:
+        return None
+
+    uptime = status_data['uptime']
+    estimated_ppm = stats_data['estimated_ppm']
+
+    last_1min_messages = stats_data['last1min']['messages']
+    last_5min_messages = stats_data['last5min']['messages']
+    last_15min_messages = stats_data['last15min']['messages']
+    total_messages = stats_data['total']['messages']
+
+    last_1min_positions = stats_data['last1min']['position_count_total']
+    last_5min_positions = stats_data['last5min']['position_count_total']
+    last_15min_positions = stats_data['last15min']['position_count_total']
+    total_positions = stats_data['total']['position_count_total']
+
+    current_unique_aircraft_with_pos = set(
+        aircraft['hex'] for aircraft in aircraft_data['aircraft']
+        if 'seen_pos' in aircraft and aircraft['seen_pos'] < 60
+    )
+
+    current_unique_total_aircraft = set()
+    for aircraft in aircraft_data['aircraft']:
+        hex_code = aircraft['hex']
+        if hex_code not in current_unique_total_aircraft:
+            current_unique_total_aircraft.add(hex_code)
+
+    range_values = [
+        aircraft['r_dst'] for aircraft in aircraft_data['aircraft']
+        if 'seen_pos' in aircraft and aircraft['seen_pos'] < 60 and 'r_dst' in aircraft
+    ]
+
+    current_max_range = max(range_values, default=0)
+    current_min_range = min(range_values, default=0)
+    current_avg_range = sum(range_values) / len(range_values) if range_values else 0
+
+    current_max_signal = stats_data['last1min']['local']['peak_signal']
+    current_avg_signal = stats_data['last1min']['local']['signal']
+    current_min_signal = stats_data['last1min']['local']['noise']
+    strong_signals = stats_data['last1min']['local']['strong_signals']
+
+    lat = receiver_data['lat']
+    lon = receiver_data['lon']
+    version = receiver_data['version']
+
+    return {
+        'uptime': uptime,
+        'estimated_ppm': estimated_ppm,
+        'last_1min_messages': last_1min_messages,
+        'last_5min_messages': last_5min_messages,
+        'last_15min_messages': last_15min_messages,
+        'total_messages': total_messages,
+        'last_1min_positions': last_1min_positions,
+        'last_5min_positions': last_5min_positions,
+        'last_15min_positions': last_15min_positions,
+        'total_positions': total_positions,
+        'current_total_aircraft': set(aircraft['hex'] for aircraft in aircraft_data['aircraft']),
+        'current_unique_aircraft_with_pos': current_unique_aircraft_with_pos,
+        'current_unique_total_aircraft': current_unique_total_aircraft,
+        'current_max_range': current_max_range,
+        'current_min_range': current_min_range,
+        'current_avg_range': current_avg_range,
+        'current_max_signal': current_max_signal,
+        'current_avg_signal': current_avg_signal,
+        'current_min_signal': current_min_signal,
+        'strong_signals': strong_signals,
+        'range_values': range_values,
+        'lat': lat,
+        'lon': lon,
+        'version': version,
+        'aircraft_with_pos': status_data['aircraft_with_pos'],
+        'aircraft_without_pos': status_data['aircraft_without_pos'],
+        'last_1min_max_range': stats_data['last1min']['max_distance'],
+        'last_5min_max_range': stats_data['last5min']['max_distance'],
+        'last_15min_max_range': stats_data['last15min']['max_distance']
+    }
+
+def get_agc_and_gain():
+    """Check AGC status and get the gain value."""
+    with open("/boot/adsbx-env", "r") as f:
+        env_file = f.read()
+
+    if re.search(r"^RECEIVER_OPTIONS=.*--enable-agc", env_file, re.MULTILINE):
+        agc_status = "On"
+    else:
+        agc_status = "Off"
+
+    # Ensure the stats file is available before loading
+    stats_file = '/var/run/readsb/stats.json'
+    while not os.path.exists(stats_file):
+        time.sleep(1)  # Wait for 1 second before retrying
+
+    stats_data = load_json_file(stats_file)
+    gain_db = stats_data['gain_db']
+    return agc_status, gain_db
+
+def update_cumulative(stats):
+    global cumulative_max_aircraft, cumulative_min_aircraft, cumulative_max_aircraft_timestamp, cumulative_min_aircraft_timestamp
+    global cumulative_most_messages, cumulative_most_messages_timestamp, cumulative_most_messages_persec, cumulative_most_messages_persec_timestamp
+    global cumulative_most_positions, cumulative_most_positions_timestamp, cumulative_most_positions_persec, cumulative_most_positions_persec_timestamp
+    global cumulative_unique_aircraft_with_pos, cumulative_unique_total_aircraft, cumulative_unique_aircraft_without_pos
+    global cumulative_max_range, cumulative_min_range, cumulative_avg_range
+    global cumulative_max_signal, cumulative_avg_signal, cumulative_min_signal
+    global cumulative_strong_signals, cumulative_messages
+    global record_max_range, record_min_range, record_max_aircraft, record_min_aircraft
+    global record_max_range_timestamp, record_min_range_timestamp, record_max_aircraft_timestamp, record_min_aircraft_timestamp
+    global record_max_uptime, record_max_uptime_timestamp
+    global record_max_messages, record_max_messages_timestamp, record_max_messages_per_sec, record_max_messages_per_sec_timestamp
+    global record_max_positions, record_max_positions_timestamp
+    global previous_strong_signals, cumulative_percent_strong
+
+    current_time = time.time()
+
+    current_unique_aircraft_with_pos = set(stats['current_unique_aircraft_with_pos'])
+    current_unique_total_aircraft = set(stats['current_unique_total_aircraft'])
+
+    # Update cumulative unique aircraft with positions
+    for aircraft in current_unique_aircraft_with_pos:
+        if aircraft not in cumulative_unique_aircraft_with_pos or \
+                current_time - cumulative_unique_aircraft_with_pos[aircraft] > 3600:
+            cumulative_unique_aircraft_with_pos[aircraft] = current_time
+
+    # Update cumulative unique total aircraft
+    for aircraft in current_unique_total_aircraft:
+        if aircraft not in cumulative_unique_total_aircraft or \
+                current_time - cumulative_unique_total_aircraft[aircraft] > 3600:
+            cumulative_unique_total_aircraft[aircraft] = current_time
+
+    # Update cumulative unique aircraft without positions
+    cumulative_unique_aircraft_without_pos = set(cumulative_unique_total_aircraft.keys()) - set(cumulative_unique_aircraft_with_pos.keys())
+
+    # Update cumulative max and min range
+    if stats['current_max_range'] >= cumulative_max_range:
+        cumulative_max_range = stats['current_max_range']
+
+    if stats['current_min_range'] <= cumulative_min_range:
+        cumulative_min_range = stats['current_min_range']
+
+    # Update record max and min range
+    if stats['current_max_range'] >= record_max_range:
+        record_max_range = stats['current_max_range']
+        record_max_range_timestamp = current_time
+
+    # Update record min range with comparison at three decimal points
+    if round(stats['current_min_range'], 3) <= round(record_min_range, 3):
+        record_min_range = stats['current_min_range']
+        record_min_range_timestamp = current_time
+
+    # Update cumulative max and min aircraft counts
+    current_total_aircraft = len(current_unique_total_aircraft)
+
+    if current_total_aircraft >= cumulative_max_aircraft:
+        cumulative_max_aircraft = current_total_aircraft
+        cumulative_max_aircraft_timestamp = current_time
+
+    if current_total_aircraft <= cumulative_min_aircraft:
+        cumulative_min_aircraft = current_total_aircraft
+        cumulative_min_aircraft_timestamp = current_time
+
+    # Update record max and min aircraft counts
+    if current_total_aircraft >= record_max_aircraft:
+        record_max_aircraft = current_total_aircraft
+        record_max_aircraft_timestamp = current_time
+
+    if current_total_aircraft <= record_min_aircraft:
+        record_min_aircraft = current_total_aircraft
+        record_min_aircraft_timestamp = current_time
+
+    # Update record max uptime
+    if stats['uptime'] >= record_max_uptime:
+        record_max_uptime = stats['uptime']
+        record_max_uptime_timestamp = current_time
+
+    # Update cumulative most messages
+    if stats['last_1min_messages'] >= cumulative_most_messages:
+        cumulative_most_messages = stats['last_1min_messages']
+        cumulative_most_messages_timestamp = current_time
+
+    # Update cumulative most messages per second
+    if stats['last_1min_messages'] / 60 >= cumulative_most_messages_persec:
+        cumulative_most_messages_persec = stats['last_1min_messages'] / 60
+        cumulative_most_messages_persec_timestamp = current_time
+
+    # Update cumulative most positions
+    if stats['last_1min_positions'] >= cumulative_most_positions:
+        cumulative_most_positions = stats['last_1min_positions']
+        cumulative_most_positions_timestamp = current_time
+
+    # Update cumulative most positions per second
+    if stats['last_1min_positions'] / 60 >= cumulative_most_positions_persec:
+        cumulative_most_positions_persec = stats['last_1min_positions'] / 60
+        cumulative_most_positions_persec_timestamp = current_time
+
+    # Update record max messages
+    if stats['last_1min_messages'] >= record_max_messages:
+        record_max_messages = stats['last_1min_messages']
+        record_max_messages_timestamp = current_time
+
+    # Update record max messages per second
+    if stats['last_1min_messages'] / 60 >= record_max_messages_per_sec:
+        record_max_messages_per_sec = stats['last_1min_messages'] / 60
+        record_max_messages_per_sec_timestamp = current_time
+
+    # Update record max positions
+    if stats['last_1min_positions'] >= record_max_positions:
+        record_max_positions = stats['last_1min_positions']
+        record_max_positions_timestamp = current_time
+
+    cumulative_messages += stats['last_1min_messages']
+
+    total_aircraft = len(current_unique_total_aircraft)
+    if len(cumulative_unique_total_aircraft) > 0:
+        cumulative_avg_range = (
+            cumulative_avg_range * (len(cumulative_unique_total_aircraft) - total_aircraft)
+            + stats['current_avg_range'] * total_aircraft
+        ) / len(cumulative_unique_total_aircraft)
+
+    cumulative_max_signal = max(cumulative_max_signal, stats['current_max_signal'])
+
+    if len(cumulative_unique_total_aircraft) > 0:
+        cumulative_avg_signal = (
+            cumulative_avg_signal * (len(cumulative_unique_total_aircraft) - total_aircraft)
+            + stats['current_avg_signal'] * total_aircraft
+        ) / len(cumulative_unique_total_aircraft)
+    cumulative_min_signal = min(cumulative_min_signal, stats['current_min_signal'])
+
+    if stats['strong_signals'] != previous_strong_signals:
+        cumulative_strong_signals += stats['strong_signals']
+        cumulative_percent_strong = cumulative_strong_signals / cumulative_messages * 100 if cumulative_messages else 0
+        previous_strong_signals = stats['strong_signals']
+
+def save_record_data():
+    """Save cumulative data to the config file."""
+
+    config["record_max_range"] = record_max_range
+    config["record_min_range"] = record_min_range
+    config["record_max_aircraft"] = record_max_aircraft
+    config["record_min_aircraft"] = record_min_aircraft
+    config["record_max_range_timestamp"] = record_max_range_timestamp
+    config["record_min_range_timestamp"] = record_min_range_timestamp
+    config["record_max_aircraft_timestamp"] = record_max_aircraft_timestamp
+    config["record_min_aircraft_timestamp"] = record_min_aircraft_timestamp
+    config["record_max_uptime"] = record_max_uptime
+    config["record_max_uptime_timestamp"] = record_max_uptime_timestamp
+    config["record_max_messages"] = record_max_messages
+    config["record_max_messages_timestamp"] = record_max_messages_timestamp
+    config["record_max_messages_per_sec"] = record_max_messages_per_sec
+    config["record_max_messages_per_sec_timestamp"] = record_max_messages_per_sec_timestamp
+    config["record_max_positions"] = record_max_positions
+    config["record_max_positions_timestamp"] = record_max_positions_timestamp
+
+    with open(config_file_path, "w") as config_file:
+        json.dump(config, config_file, indent=4)
+
+def print_status(stats):
+    global previous_strong_signals, cumulative_strong_signals, cumulative_percent_strong
+
+    """Print the current status and cumulative statistics."""
+    box_width = 65
+    formatted_uptime = calculate_uptime(stats['uptime'])
+    session_uptime = calculate_uptime(time.time() - script_start_time)
+    formatted_agc = 'AGC: ' + stats.get('agc_status', 'off')
+    percent_strong = stats['strong_signals'] / stats['last_1min_messages'] * 100 if stats['last_1min_messages'] else 0
+
+    current_unique_total_aircraft = len(cumulative_unique_total_aircraft)
+    current_unique_aircraft_with_pos = len(cumulative_unique_aircraft_with_pos)
+    current_unique_aircraft_without_pos = current_unique_total_aircraft - current_unique_aircraft_with_pos
+
+    print("\033c", end="")  # Clear the console
+
+    def wrap_text(text, width):
+        return '\n'.join(textwrap.wrap(text, width=width))
+
+    def center_text(text, width):
+        return text.center(width)
+
+    def format_range(value):
+        if value < 0.5:
+            return f"{value * 6076.12:>7.1f} FT"
+        else:
+            return f"{value:>7.1f} NM"
+
+    # Preprocess version variable
+    version_text = stats.get('version', '')
+    git_separator_idx = version_text.find('git:')
+    if git_separator_idx != -1:
+        version_number = version_text[:git_separator_idx].strip()
+        git_info = version_text[git_separator_idx:].strip()
+
+    # Uptime box
+    uptime_box = [
+        [f"┌{'─' * (box_width - 2)}┐"],
+        [f"│{center_text('Uptime', box_width - 2)}│"],
+        [f"├{'─' * (box_width - 2)}┤"],
+        [f"│    ADSBTop:  {session_uptime}".ljust(box_width - 1) + "│"],
+        [f"│     Readsb:  {formatted_uptime}".ljust(box_width - 1) + "│"],
+        [f"│{' ' * (box_width - 2)}│"],
+        [f"│   All Time:  {calculate_uptime(record_max_uptime):>14} ({datetime.fromtimestamp(record_max_uptime_timestamp).strftime('%Y-%m-%d %H:%M')})".ljust(box_width - 1) + "│"],
+        [f"└{'─' * (box_width - 2)}┘"],
+    ]
+
+    # Version box
+    version_box = [
+        [f"┌{'─' * (box_width - 2)}┐"],
+        [f"│{center_text('Version', box_width - 2)}│"],
+        [f"├{'─' * (box_width - 2)}┤"],
+        [f"│    ADSBTop    {adsbtop_version}".ljust(box_width - 1) + "│"],
+        [f"│{' ' * (box_width - 2)}│"],
+        [f"│    {version_number}".ljust(box_width - 1) + "│"],
+        [f"│    {git_info}".ljust(box_width - 1) + "│"],
+        [f"└{'─' * (box_width - 2)}┘"],
+    ]
+
+    # Receiver box
+    receiver_box = [
+        [f"┌{'─' * (box_width - 2)}┐"],
+        [f"│{center_text('Receiver', box_width - 2)}│"],
+        [f"├{'─' * (box_width - 2)}┤"],
+        [f"│    Gain: {stats.get('gain_db', 0):<5.1f}dB ({stats.get('estimated_ppm', 0):<5.1f}ppm)".ljust(box_width - 1) + "│"],
+        [f"│     {formatted_agc}".ljust(box_width - 1) + "│"],
+        [f"└{'─' * (box_width - 2)}┘"],
+    ]
+
+    # Location box
+    location_box = [
+        [f"┌{'─' * (box_width - 2)}┐"],
+        [f"│{center_text('Location', box_width - 2)}│"],
+        [f"├{'─' * (box_width - 2)}┤"],
+        [f"│    Lat: {stats.get('lat', 0):<9.6f}, Lon: {stats.get('lon', 0):<9.6f}".ljust(box_width - 1) + "│"],
+        [f"│{' '.ljust(box_width - 2)}│"],
+        [f"└{'─' * (box_width - 2)}┘"],
+    ]
+    # Messages box
+    messages_box = [
+        [f"┌{'─' * (box_width - 2)}┐"],
+        [f"│{center_text('Messages', box_width - 2)}│"],
+        [f"├{'─' * (box_width - 2)}┤"],
+        [f"│    Last  1 min {stats.get('last_1min_messages', 0):>12,.0f}  ({stats.get('last_1min_messages', 0) / 60:>.0f} msg/sec)".ljust(box_width - 1) + "│"],
+        [f"│    Last  5 min {stats.get('last_5min_messages', 0):>12,.0f}  ({stats.get('last_5min_messages', 0) / 300:>.0f} msg/sec)".ljust(box_width - 1) + "│"],
+        [f"│    Last 15 min {stats.get('last_15min_messages', 0):>12,.0f}  ({stats.get('last_15min_messages', 0) / 900:>.0f} msg/sec)".ljust(box_width - 1) + "│"],
+        [f"│{' ' * (box_width - 2)}│"],
+        [f"│    Total       {stats.get('total_messages', 0):>12,.0f}  ({stats.get('total_messages', 0) / stats.get('uptime', 1):>.0f} msg/sec)".ljust(box_width - 1) + "│"],
+        [f"│{' ' * (box_width - 2)}│"],
+        [f"│    Session (1 min peak)".ljust(box_width - 1) + "│"],
+        [f"│           Most {cumulative_most_messages:>12,.0f} Messages ({datetime.fromtimestamp(cumulative_most_messages_timestamp).strftime('%Y-%m-%d %H:%M')})".ljust(box_width - 1) + "│"],
+        [f"│        Fastest {cumulative_most_messages_persec:>12,.0f} msg/sec  ({datetime.fromtimestamp(cumulative_most_messages_persec_timestamp).strftime('%Y-%m-%d %H:%M')})".ljust(box_width - 1) + "│"],
+        [f"│{' ' * (box_width - 2)}│"],
+        [f"│    All Time".ljust(box_width - 1) + "│"],
+        [f"│           Most {record_max_messages:>12,.0f} Messages ({datetime.fromtimestamp(record_max_messages_timestamp).strftime('%Y-%m-%d %H:%M')})".ljust(box_width - 1) + "│"],
+        [f"│        Fastest {record_max_messages_per_sec:>12,.0f} msg/sec  ({datetime.fromtimestamp(record_max_messages_per_sec_timestamp).strftime('%Y-%m-%d %H:%M')})".ljust(box_width - 1) + "│"],
+        [f"└{'─' * (box_width - 2)}┘"],
+    ]
+
+    # Positions box
+    positions_box = [
+        [f"┌{'─' * (box_width - 2)}┐"],
+        [f"│{center_text('Positions', box_width - 2)}│"],
+        [f"├{'─' * (box_width - 2)}┤"],
+        [f"│    Last  1 min {stats.get('last_1min_positions', 0):>12,.0f}  ({stats.get('last_1min_positions', 0) / 60:>.0f} pos/sec)".ljust(box_width - 1) + "│"],
+        [f"│    Last  5 min {stats.get('last_5min_positions', 0):>12,.0f}  ({stats.get('last_5min_positions', 0) / 300:>.0f} pos/sec)".ljust(box_width - 1) + "│"],
+        [f"│    Last 15 min {stats.get('last_15min_positions', 0):>12,.0f}  ({stats.get('last_15min_positions', 0) / 900:>.0f} pos/sec)".ljust(box_width - 1) + "│"],
+        [f"│{' ' * (box_width - 2)}│"],
+        [f"│    Total       {stats.get('total_positions', 0):>12,.0f}  ({stats.get('total_positions', 0) / stats.get('uptime', 1):>.0f} pos/sec)".ljust(box_width - 1) + "│"],
+        [f"│{' ' * (box_width - 2)}│"],
+        [f"│    Session (1 min peak)".ljust(box_width - 1) + "│"],
+        [f"│           Most {cumulative_most_positions:>12,.0f} Positions ({datetime.fromtimestamp(cumulative_most_positions_timestamp).strftime('%Y-%m-%d %H:%M')})".ljust(box_width - 1) + "│"],
+        [f"│        Fastest {cumulative_most_positions_persec:>12,.0f} pos/sec   ({datetime.fromtimestamp(cumulative_most_positions_persec_timestamp).strftime('%Y-%m-%d %H:%M')})".ljust(box_width - 1) + "│"],
+        [f"│{' ' * (box_width - 2)}│"],
+        [f"│    All Time".ljust(box_width - 1) + "│"],
+        [f"│           Most {record_max_positions:>12,.0f} Positions ({datetime.fromtimestamp(record_max_positions_timestamp).strftime('%Y-%m-%d %H:%M')})".ljust(box_width - 1) + "│"],
+        [f"│        Fastest {record_max_positions / 60:>12,.0f} pos/sec   ({datetime.fromtimestamp(record_max_positions_timestamp).strftime('%Y-%m-%d %H:%M')})".ljust(box_width - 1) + "│"],
+        [f"└{'─' * (box_width - 2)}┘"],
+    ]
+
+    # Aircraft box
+    aircraft_box = [
+        [f"┌{'─' * (box_width - 2)}┐"],
+        [f"│{center_text('Aircraft', box_width - 2)}│"],
+        [f"├{'─' * (box_width - 2)}┤"],
+        [f"│    {'Current':<37}{str(len(stats['current_total_aircraft'])):>8}".ljust(box_width - 1) + "│"],
+        [f"│        {'With Positions':<33}{str(stats.get('aircraft_with_pos', 0)):>8}".ljust(box_width - 1) + "│"],
+        [f"│        {'Without Positions':<33}{str(stats.get('aircraft_without_pos', 0)):>8}".ljust(box_width - 1) + "│"],
+        [f"│{' ' * (box_width - 2)}│"],
+        [f"│    {'Unique':<37}{str(len(cumulative_unique_total_aircraft)):>8}".ljust(box_width - 1) + "│"],
+        [f"│        {'With Positions':<33}{str(len(cumulative_unique_aircraft_with_pos)):>8}".ljust(box_width - 1) + "│"],
+        [f"│        {'Without Positions':<33}{str(len(cumulative_unique_aircraft_without_pos)):>8}".ljust(box_width - 1) + "│"],
+        [f"│{' ' * (box_width - 2)}│"],
+        [f"│    Session".ljust(box_width - 1) + "│"],
+        [f"│        Most   {str(cumulative_max_aircraft):>4} ({datetime.fromtimestamp(cumulative_max_aircraft_timestamp).strftime('%Y-%m-%d %H:%M')})".ljust(box_width - 1) + "│"],
+        [f"│       Least   {str(cumulative_min_aircraft):>4} ({datetime.fromtimestamp(cumulative_min_aircraft_timestamp).strftime('%Y-%m-%d %H:%M')})".ljust(box_width - 1) + "│"],
+        [f"│{' ' * (box_width - 2)}│"],
+        [f"│    All Time".ljust(box_width - 1) + "│"],
+        [f"│        Most   {str(record_max_aircraft):>4} ({datetime.fromtimestamp(record_max_aircraft_timestamp).strftime('%Y-%m-%d %H:%M')})".ljust(box_width - 1) + "│"],
+        [f"│       Least   {str(record_min_aircraft):>4} ({datetime.fromtimestamp(record_min_aircraft_timestamp).strftime('%Y-%m-%d %H:%M')})".ljust(box_width - 1) + "│"],
+        [f"└{'─' * (box_width - 2)}┘"],
+    ]
+
+
+    #Range box
+    range_box = [
+        [f"┌{'─' * (box_width - 2)}┐"],
+        [f"│{center_text('Range', box_width - 2)}│"],
+        [f"├{'─' * (box_width - 2)}┤"],
+        [f"│{' ' * 24}{center_text('[Max]', 10)}{' ' * 4}{center_text('[Avg]', 10)}{' ' * 4}{center_text('[Min]', 10)}".ljust(box_width - 1) + "│"],
+        [f"│    Current        {stats.get('current_max_range', 0):>10.1f} NM {stats.get('current_avg_range', 0):>10.1f} NM   {format_range(stats.get('current_min_range', 0))}".ljust(box_width - 1) + "│"],
+        [f"│{' ' * (box_width - 2)}│"],
+        [f"│    Last  1 min    {stats.get('last_1min_max_range', 0) * 0.000539957:>10.1f} NM".ljust(box_width - 1) + "│"],
+        [f"│    Last  5 min    {stats.get('last_5min_max_range', 0) * 0.000539957:>10.1f} NM".ljust(box_width - 1) + "│"],
+        [f"│    Last 15 min    {stats.get('last_15min_max_range', 0) * 0.000539957:>10.1f} NM".ljust(box_width - 1) + "│"],
+        [f"│{' ' * (box_width - 2)}│"],
+        [f"│    Session        {float(cumulative_max_range):>10.1f} NM {float(cumulative_avg_range):>10.1f} NM   {format_range(float(cumulative_min_range))}".ljust(box_width - 1) + "│"],
+        [f"│{' ' * (box_width - 2)}│"],
+        [f"│    All Time".ljust(box_width - 1) + "│"],
+        [f"│        Furthest      {float(record_max_range):>7.1f} NM ({datetime.fromtimestamp(record_max_range_timestamp).strftime('%Y-%m-%d %H:%M')})".ljust(box_width - 1) + "│"],
+        [f"│         Closest      {format_range(float(record_min_range))} ({datetime.fromtimestamp(record_min_range_timestamp).strftime('%Y-%m-%d %H:%M')})".ljust(box_width - 1) + "│"],
+        [f"│{' ' * (box_width - 2)}│"],
+        [f"│{' ' * (box_width - 2)}│"],
+        [f"│{' ' * (box_width - 2)}│"],
+        [f"└{'─' * (box_width - 2)}┘"],
+    ]
+
+    # Signals box
+    signals_box = [
+        [f"┌{'─' * (box_width - 2)}┐"],
+        [f"│{center_text('Signals', box_width - 2)}│"],
+        [f"├{'─' * (box_width - 2)}┤"],
+        [f"│{' ' * 20}{'[Max]':>10}  {'[Avg]':>10}   {'[Min]':>9}".ljust(box_width - 1) + "│"],
+        [f"│       Current       {stats.get('current_max_signal', 0):>6.1f} dBFS {stats.get('current_avg_signal', 0):>6.1f} dBFS {stats.get('current_min_signal', 0):>6.1f} dBFS".ljust(box_width - 1) + "│"],
+        [f"│    Cumulative       {cumulative_max_signal:>6.1f} dBFS {cumulative_avg_signal:>6.1f} dBFS {cumulative_min_signal:>6.1f} dBFS".ljust(box_width - 1) + "│"],
+        [f"└{'─' * (box_width - 2)}┘"],
+    ]
+
+    # Strong Signals box
+    strong_signals_box = [
+        [f"┌{'─' * (box_width - 2)}┐"],
+        [f"│{center_text('Strong Signals', box_width - 2)}│"],
+        [f"├{'─' * (box_width - 2)}┤"],
+        [f"│{' ' * 22}{'[Signals]':>10}  {'[% > -3dBFS]':>10}".ljust(box_width - 1) + "│"],
+        [f"│       Current     {stats.get('strong_signals', 0):>13,.0f}  ({percent_strong:>.2f}%)".ljust(box_width - 1) + "│"],
+        [f"│    Cumulative     {cumulative_strong_signals:>13,.0f}  ({cumulative_percent_strong:>.2f}%)".ljust(box_width - 1) + "│"],
+        [f"└{'─' * (box_width - 2)}┘"],
+    ]
+
+
+    # Print the boxes using tabulate
+    with lock:  # Locking this section to ensure consistency
+        uptime_version_box = [
+            [uptime_box[i][0], version_box[i][0]] for i in range(len(uptime_box))
+        ]
+        print(tabulate(uptime_version_box, tablefmt="plain"))
+        print()
+
+        receiver_location_box = [
+            [receiver_line or ' ' * box_width, location_line or ' ' * box_width]
+            for receiver_line, location_line in zip_longest(
+                [line[0] for line in receiver_box],
+                [line[0] for line in location_box],
+                fillvalue=' ' * box_width
+            )
+        ]
+        print(tabulate(receiver_location_box, tablefmt="plain"))
+        print()
+
+        messages_positions_box = [
+            [messages_box[i][0], positions_box[i][0]] for i in range(len(messages_box))
+        ]
+        print(tabulate(messages_positions_box, tablefmt="plain"))
+        print()
+
+        # Modify the aircraft_range_box creation to handle different lengths
+        aircraft_range_box = []
+        for i in range(max(len(aircraft_box), len(range_box))):
+            aircraft_line = aircraft_box[i][0] if i < len(aircraft_box) else ' ' * box_width
+            range_line = range_box[i][0] if i < len(range_box) else ' ' * box_width
+            aircraft_range_box.append([aircraft_line, range_line])
+        print(tabulate(aircraft_range_box, tablefmt="plain"))
+        print()
+
+        # Print the signals and strong signals boxes
+        signals_strong_signals_box = []
+        for i in range(max(len(signals_box), len(strong_signals_box))):
+            signal_line = signals_box[i][0] if i < len(signals_box) else ' ' * box_width
+            strong_signal_line = strong_signals_box[i][0] if i < len(strong_signals_box) else ' ' * box_width
+            signals_strong_signals_box.append([signal_line, strong_signal_line])
+        print(tabulate(signals_strong_signals_box, tablefmt="plain"))
+
+class JsonFileEventHandler(FileSystemEventHandler):
+    def on_modified(self, event):
+        if event.src_path in json_files:
+            print("\033c", end="")  # Clear the console
+            try:
+                stats = extract_statistics()
+                if stats:
+                    update_cumulative(stats)
+                    agc_status, gain_db = get_agc_and_gain()
+                    stats['agc_status'] = agc_status
+                    stats['gain_db'] = gain_db
+                    print_status(stats)
+                    save_record_data()  # Save cumulative data after each update
+            except Exception as e:
+                print(f"Error processing file modification: {e}")
+
+    def on_moved(self, event):
+        if event.dest_path in json_files:
+            print("\033c", end="")  # Clear the console
+            try:
+                stats = extract_statistics()
+                if stats:
+                    update_cumulative(stats)
+                    agc_status, gain_db = get_agc_and_gain()
+                    stats['agc_status'] = agc_status
+                    stats['gain_db'] = gain_db
+                    print_status(stats)
+                    save_record_data()  # Save cumulative data after each update
+            except Exception as e:
+                print(f"Error processing file move: {e}")
+
+    def on_created(self, event):
+        if event.src_path in json_files:
+            print("\033c", end="")  # Clear the console
+            print("JSON files recreated. Resuming monitoring...")
+            try:
+                stats = extract_statistics()
+                if stats:
+                    update_cumulative(stats)
+                    agc_status, gain_db = get_agc_and_gain()
+                    stats['agc_status'] = agc_status
+                    stats['gain_db'] = gain_db
+                    print_status(stats)
+                    save_record_data()  # Save cumulative data after each update
+            except Exception as e:
+                print(f"Error processing file creation: {e}")
+
+def wait_for_json_files():
+    while True:
+        all_files_exist = all([os.path.exists(file) for file in json_files])
+        if all_files_exist:
+            break
+        print("\rWaiting for data files...", end="", flush=True)
+        time.sleep(1)
+    print("\rData files found. Starting monitoring...          ")
+
+# Wait for the JSON files to be available
+wait_for_json_files()
+
+# Initial processing of data once files are available
+stats = extract_statistics()
+if stats:
+    update_cumulative(stats)
+    agc_status, gain_db = get_agc_and_gain()
+    stats['agc_status'] = agc_status
+    stats['gain_db'] = gain_db
+    print_status(stats)
+
+# Set up the observer to watch for changes in the JSON files
+event_handler = JsonFileEventHandler()
+observer = Observer()
+observer.schedule(event_handler, path=monitor_path, recursive=False)
+observer.start()
+try:
+    hide_cursor()
+    while True:
+        time.sleep(1)
+        stats = extract_statistics()
+        if stats:
+            update_cumulative(stats)
+            agc_status, gain_db = get_agc_and_gain()
+            stats['agc_status'] = agc_status
+            stats['gain_db'] = gain_db
+            print_status(stats)
+            save_record_data()  # Save cumulative data after each update
+except KeyboardInterrupt:
+    observer.stop()
+finally:
+    show_cursor()
+    observer.join()
