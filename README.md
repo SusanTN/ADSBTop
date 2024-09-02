@@ -40,7 +40,7 @@ sudo chmod a+x /usr/local/sbin/adsbtop
 Ensure all required Python modules are installed by running the following pip command:
 
 ```
-pip install sys json time os re tabulate watchdog textwrap threading datetime
+pip install sys json time os re tabulate watchdog textwrap threading datetime shutil itertools
 ```
 
 ## [Optional] Create and Configure the INI File
