@@ -43,7 +43,7 @@ Ensure all required Python modules are installed by running the following pip co
 pip install sys json time os re tabulate watchdog textwrap threading datetime
 ```
 
-##[Optional] Create and Configure the INI File
+## [Optional] Create and Configure the INI File
 
 ADSBTop automatically creates a configuration file (/etc/adsbtop.json) upon its first run if it does not already exist. You can manually create and configure this file if needed:
 
